@@ -1,0 +1,18 @@
+filebeat.inputs:
+  - type: filestream
+    id: payment-logs
+    paths:
+      - /logs/*/application.log
+    parsers:
+      - ndjson:
+          target: ""            # JSON keys (traceId, spanId, level, service, ...) become top-level fields
+          add_error_key: true
+          overwrite_keys: true
+
+setup.ilm.enabled: false
+setup.template.name: "payment-logs"
+setup.template.pattern: "payment-logs-*"
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "payment-logs-%{+yyyy.MM.dd}"

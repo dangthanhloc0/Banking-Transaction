@@ -1,0 +1,40 @@
+# ---------- build output ----------
+target/
+dependency-reduced-pom.xml
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# ---------- IDE ----------
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated
+.sts4-cache/
+
+# ---------- local Maven repository / machine-specific Maven settings ----------
+.m2/
+**/settings.xml
+
+# ---------- logs (written by the services, read by Filebeat) ----------
+logs/
+*.log
+
+# ---------- secrets / local env ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------- Docker / OS / misc ----------
+.DS_Store
+Thumbs.db
+*.tmp
+.claude/

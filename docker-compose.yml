@@ -1,0 +1,256 @@
+
+name: pm-infra
+
+# Settings shared by the three Spring Boot services (built from infra/docker/Dockerfile, context = repo root)
+x-app-env: &app-env
+  SPRING_DATASOURCE_USERNAME: root
+  SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+  COMMON_KAFKA_BOOTSTRAP_SERVERS: kafka:29092        # kafka's internal listener
+  JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m"
+
+x-app-depends: &app-depends
+  mysql:
+    condition: service_healthy
+  kafka:
+    condition: service_healthy
+  kafka-init:
+    condition: service_completed_successfully
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: pm-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}   # dev only; override with env / .env
+      TZ: Asia/Ho_Chi_Minh                                   # same zone as serverTimezone in the JDBC urls
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+07:00
+      - --max-connections=500                                # 3 services x Hikari pools (50+50+30) + tools
+      - --innodb-buffer-pool-size=1G
+      # LOAD TEST ONLY: fsync the redo log once per second instead of every commit (can lose ~1s of
+      # commits if MySQL crashes). Uncomment only after deciding to trade durability for speed.
+      # - --innodb-flush-log-at-trx-commit=2
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./infra/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: pm-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: SMPzZzAqaLk_aNYfIFE91g
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # one-shot job: creates the topics (their .DLT and the @RetryableTopic retry topics) then exits
+  kafka-init:
+    image: apache/kafka:3.7.1
+    container_name: pm-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        for topic in \
+          payment.transfer.requested.v1 \
+          payment.transfer.completed.v1 \
+          payment.transfer.failed.v1; do
+          # the DLT must have at least as many partitions as the original topic
+          for name in "$$topic" "$$topic.DLT"; do
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+              --create --if-not-exists --topic "$$name" --partitions 6 --replication-factor 1
+          done
+        done
+        # retry topics of the @RetryableTopic listeners: <topic>-retry-<delay ms>, same partition count as the main topic
+        #   requested -> AccountService (TransferRequestedListener)
+        #   completed / failed -> TransactionService (result listeners)
+        for name in \
+          payment.transfer.requested.v1-retry-1000 \
+          payment.transfer.requested.v1-retry-2000 \
+          payment.transfer.completed.v1-retry-1000 \
+          payment.transfer.completed.v1-retry-2000 \
+          payment.transfer.failed.v1-retry-1000 \
+          payment.transfer.failed.v1-retry-2000; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+            --create --if-not-exists --topic "$$name" --partitions 6 --replication-factor 1
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+    restart: "no"
+
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.5.0
+    container_name: pm-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- Log tracing: services write JSON logs to ./logs/<service>/application.log,
+  # ---- Filebeat ships them to Elasticsearch, Kibana (http://localhost:5601) searches by traceId.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: pm-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"   # dev only
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: pm-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.3
+    container_name: pm-filebeat
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      - ./infra/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./logs:/logs:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------- application services ----------------
+  # Each instance writes to its own ./logs/<name> folder so Filebeat (/logs/*/application.log) reads them separately.
+  user-service:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile
+      args: { SERVICE: UserService }
+    image: pm-user-service:local
+    container_name: pm-user-service
+    ports: ["1000:1000"]
+    environment:
+      <<: *app-env
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/user?useSSL=false&serverTimezone=Asia/Ho_Chi_Minh&allowPublicKeyRetrieval=true"
+      INSTANCE_ID: user-service-1
+    volumes: ["./logs/user-service-1:/app/logs/user-service"]
+    depends_on: *app-depends
+    restart: unless-stopped
+
+  account-service-1:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile
+      args: { SERVICE: AccountService }
+    image: pm-account-service:local
+    container_name: pm-account-service-1
+    ports: ["3000:3000"]
+    environment: &account-env
+      <<: *app-env
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/account?useSSL=false&serverTimezone=Asia/Ho_Chi_Minh&allowPublicKeyRetrieval=true"
+      INSTANCE_ID: account-service-1
+    volumes: ["./logs/account-service-1:/app/logs/account-service"]
+    depends_on: *app-depends
+    restart: unless-stopped
+
+  account-service-2:
+    image: pm-account-service:local          # same image, built by account-service-1
+    pull_policy: never
+    container_name: pm-account-service-2
+    ports: ["3001:3000"]
+    environment:
+      <<: *account-env
+      INSTANCE_ID: account-service-2
+    volumes: ["./logs/account-service-2:/app/logs/account-service"]
+    depends_on:
+      <<: *app-depends
+      account-service-1:
+        condition: service_started
+    restart: unless-stopped
+
+  transaction-service-1:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile
+      args: { SERVICE: TransactionService }
+    image: pm-transaction-service:local
+    container_name: pm-transaction-service-1
+    ports: ["2000:2000"]
+    environment: &transaction-env
+      <<: *app-env
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/transaction?useSSL=false&serverTimezone=Asia/Ho_Chi_Minh&allowPublicKeyRetrieval=true"
+      URL_USER: http://user-service:1000/users
+      INSTANCE_ID: transaction-service-1
+    volumes: ["./logs/transaction-service-1:/app/logs/transaction-service"]
+    depends_on:
+      <<: *app-depends
+      user-service:
+        condition: service_started
+    restart: unless-stopped
+
+  transaction-service-2:
+    image: pm-transaction-service:local      # same image, built by transaction-service-1
+    pull_policy: never
+    container_name: pm-transaction-service-2
+    ports: ["2001:2000"]
+    environment:
+      <<: *transaction-env
+      INSTANCE_ID: transaction-service-2
+    volumes: ["./logs/transaction-service-2:/app/logs/transaction-service"]
+    depends_on:
+      <<: *app-depends
+      transaction-service-1:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  mysql-data:

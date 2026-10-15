@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    container_name: be-aws-platform
+    ports:
+      - "2807:2807"
+    env_file:
+      - .env
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      AWS_REGION: ap-southeast-1
+      AWS_S3_BUCKET: examdocuments
+      AWS_CLOUDFRONT_DOMAIN: https://dk7db0xdierrw.cloudfront.net
+      LOGGING_LEVEL_ROOT: INFO
+      LOGGING_LEVEL_COM_LDANG03: DEBUG
+      SPRING_MAIL_HOST: email-smtp.ap-southeast-1.amazonaws.com
+      SPRING_MAIL_PORT: 587
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: "true"
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: "true"
+      APP_EMAIL_SENDER: no-reply@examplatform.cloud
+    volumes:
+      - ./application-local.properties:/app/application-local.properties:ro
+    depends_on:
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-exam
+    restart: unless-stopped

@@ -1,0 +1,9 @@
+.git
+.idea
+.m2
+**/target
+**/logs
+**/.idea
+**/*.iml
+**/.env
+**/docs

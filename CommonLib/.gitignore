@@ -1,0 +1,24 @@
+target/
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### IDEs and editors ###
+.idea/
+*.iws
+*.iml
+*.ipr
+.classpath
+.project
+.settings/
+.vscode/
+
+### Maven ###
+.mvn/wrapper/maven-wrapper.jar
+
+### Logs ###
+logs/
+*.log
+
+### Env — never commit credentials ###
+.env
+.env.local
